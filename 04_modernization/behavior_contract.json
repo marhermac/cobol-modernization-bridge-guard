@@ -1,0 +1,186 @@
+{
+  "contract_version": "1.0",
+  "source": "01_legacy/legacy_payment_processor.cbl",
+  "baseline": "COBOL LEGACY-PAYMENT-PROCESSOR",
+  "description": "Observable behavior contract extracted from COBOL source. Python implementation must preserve all items unless an approval gate is explicitly resolved.",
+
+  "business_rules": {
+    "BR-01": {
+      "description": "Only payments with STATUS = 'PENDING' are processed.",
+      "filter": "STATUS = 'PENDING'",
+      "evidence": "Cursor WHERE clause line 66"
+    },
+    "BR-02": {
+      "description": "AMOUNT <= CREDIT_LIMIT produces APPROVED status.",
+      "operator": "<=",
+      "condition": "amount <= credit_limit",
+      "result": "APPROVED",
+      "equality_boundary": {
+        "amount": "500.00",
+        "credit_limit": "500.00",
+        "expected_result": "APPROVED",
+        "note": "Equality case MUST produce APPROVED. Operator is <= not <."
+      },
+      "evidence": "IF HV-AMOUNT <= HV-CREDIT-LIMIT line 182"
+    },
+    "BR-03": {
+      "description": "AMOUNT > CREDIT_LIMIT produces REVIEW status.",
+      "operator": ">",
+      "condition": "amount > credit_limit",
+      "result": "REVIEW",
+      "evidence": "ELSE branch of IF at line 182"
+    },
+    "BR-04": {
+      "description": "Processed counter increments only on successful UPDATE (SQLCODE = 0).",
+      "condition": "UPDATE succeeds",
+      "result": "counter += 1",
+      "evidence": "IF SQLCODE NOT = 0 / ELSE ADD 1 lines 204-216"
+    },
+    "BR-05": {
+      "description": "OPEN cursor failure exits immediately via GOBACK. No COMMIT is issued.",
+      "condition": "OPEN SQLCODE != 0",
+      "result": "immediate exit, no commit",
+      "evidence": "GOBACK at line 94"
+    },
+    "BR-06": {
+      "description": "Non-zero non-100 FETCH SQLCODE terminates the loop. Processing proceeds to CLOSE and COMMIT.",
+      "condition": "FETCH SQLCODE not in (0, 100)",
+      "result": "set end-of-data, exit loop, proceed to close+commit",
+      "note": "Partial batch is committed. No ROLLBACK.",
+      "evidence": "WHEN OTHER SET END-OF-DATA lines 142-147"
+    },
+    "BR-07": {
+      "description": "Single COMMIT after the full batch. No per-row commits.",
+      "granularity": "single_batch_commit",
+      "evidence": "EXEC SQL COMMIT lines 104-106"
+    },
+    "BR-08": {
+      "description": "ACCOUNT_ID is fetched and must remain in the data model.",
+      "field": "ACCOUNT_ID",
+      "used_in_business_logic": false,
+      "must_be_retained": true,
+      "evidence": "ACCOUNT_ID in SELECT line 60 and FETCH INTO line 127"
+    },
+    "BR-09": {
+      "description": "STATUS is fetched but not independently re-evaluated in business logic.",
+      "field": "STATUS",
+      "cursor_filter": "STATUS = 'PENDING'",
+      "re_evaluated": false,
+      "evidence": "STATUS in SELECT line 63, no business conditional reads HV-STATUS"
+    },
+    "BR-10": {
+      "description": "CLOSE and COMMIT errors are silently ignored.",
+      "checked": false,
+      "evidence": "No IF SQLCODE check after CLOSE (lines 100-102) or COMMIT (lines 104-106)"
+    }
+  },
+
+  "data_model": {
+    "record": "PaymentRecord",
+    "fields": {
+      "payment_id":     { "cobol_field": "HV-PAYMENT-ID",    "cobol_type": "PIC S9(9) COMP",        "python_type": "int",     "required": true },
+      "account_id":     { "cobol_field": "HV-ACCOUNT-ID",    "cobol_type": "PIC S9(9) COMP",        "python_type": "int",     "required": true,  "approval_gate": "APPROVAL-04" },
+      "amount":         { "cobol_field": "HV-AMOUNT",        "cobol_type": "PIC S9(7)V99 COMP-3",   "python_type": "Decimal", "required": true,  "note": "MUST use decimal.Decimal, not float" },
+      "credit_limit":   { "cobol_field": "HV-CREDIT-LIMIT",  "cobol_type": "PIC S9(7)V99 COMP-3",   "python_type": "Decimal", "required": true,  "note": "MUST use decimal.Decimal, not float" },
+      "status":         { "cobol_field": "HV-STATUS",        "cobol_type": "PIC X(10)",             "python_type": "str",     "required": true },
+      "customer_name":  { "cobol_field": "HV-CUSTOMER-NAME", "cobol_type": "PIC X(40)",             "python_type": "str",     "required": true }
+    }
+  },
+
+  "status_values": {
+    "input_filter": "PENDING",
+    "output_approved": "APPROVED",
+    "output_review": "REVIEW"
+  },
+
+  "comparison_operator": {
+    "operator": "<=",
+    "python_equivalent": "amount <= credit_limit",
+    "equality_case": "APPROVED",
+    "approval_gate": "APPROVAL-01",
+    "note": "MUST NOT be changed to < without explicit approval of APPROVAL-01"
+  },
+
+  "numeric_fidelity": {
+    "monetary_fields": ["amount", "credit_limit"],
+    "required_type": "decimal.Decimal",
+    "forbidden_type": "float",
+    "rationale": "COBOL PIC S9(7)V99 COMP-3 is packed decimal. float cannot represent all values exactly."
+  },
+
+  "transaction_semantics": {
+    "granularity": "single_commit_end_of_batch",
+    "rollback": false,
+    "partial_commit_on_fetch_error": true,
+    "approval_gate_granularity": "APPROVAL-05",
+    "approval_gate_partial_commit": "APPROVAL-06"
+  },
+
+  "error_handling": {
+    "open_failure": { "action": "exit_immediately", "commit": false },
+    "fetch_normal_eof": { "sqlcode": 100, "action": "set_eof_flag" },
+    "fetch_error": { "action": "set_eof_flag_and_exit_loop", "rollback": false, "commit": "proceeds_normally" },
+    "update_failure": { "action": "display_error_and_continue", "counter_increment": false },
+    "close_failure": { "action": "silently_ignored", "approval_gate": "APPROVAL-02" },
+    "commit_failure": { "action": "silently_ignored", "approval_gate": "APPROVAL-02" }
+  },
+
+  "counters": {
+    "processed_count": {
+      "increment_condition": "UPDATE SQLCODE = 0",
+      "decrement": false,
+      "reset": false,
+      "initial_value": 0
+    }
+  },
+
+  "boundary_test_cases": [
+    {
+      "id": "BC-01",
+      "description": "Amount strictly below limit",
+      "amount": "499.99",
+      "credit_limit": "500.00",
+      "expected_status": "APPROVED"
+    },
+    {
+      "id": "BC-02",
+      "description": "Amount exactly equal to limit — CRITICAL EQUALITY BOUNDARY",
+      "amount": "500.00",
+      "credit_limit": "500.00",
+      "expected_status": "APPROVED",
+      "note": "This MUST be APPROVED per <= operator. Changing to REVIEW requires APPROVAL-01."
+    },
+    {
+      "id": "BC-03",
+      "description": "Amount strictly above limit",
+      "amount": "500.01",
+      "credit_limit": "500.00",
+      "expected_status": "REVIEW"
+    },
+    {
+      "id": "BC-04",
+      "description": "Zero amount",
+      "amount": "0.00",
+      "credit_limit": "500.00",
+      "expected_status": "APPROVED"
+    },
+    {
+      "id": "BC-05",
+      "description": "Zero limit with non-zero amount",
+      "amount": "1.00",
+      "credit_limit": "0.00",
+      "expected_status": "REVIEW"
+    },
+    {
+      "id": "BC-06",
+      "description": "Zero amount with zero limit",
+      "amount": "0.00",
+      "credit_limit": "0.00",
+      "expected_status": "APPROVED"
+    }
+  ],
+
+  "unresolved_approval_gates": ["APPROVAL-01", "APPROVAL-02", "APPROVAL-03", "APPROVAL-04", "APPROVAL-05", "APPROVAL-06"],
+
+  "modernization_baseline": "All unresolved approval gates default to COBOL legacy behavior."
+}
